@@ -1,2 +1,3 @@
 .vagrant
 .vault_pass
+/src/join.sh

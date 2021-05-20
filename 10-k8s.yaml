@@ -1,0 +1,180 @@
+- hosts: master:workers
+  become: true
+  vars:
+    # Version of kubeadm, kubectl and kubelet packages. Make sure you know what you
+    # are doing before modifying this variable. It can damage the entire
+    # cluster.
+    k8s_version: 1.19.1-00
+
+  tasks:
+    - name: Load the br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
+
+    - name: Configure the network to let iptables see bridged traffic
+      sysctl:
+        name: "{{item}}"
+        value: "1"
+        reload: true
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      with_items:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+
+    # https://github.com/coredns/coredns/issues/2693#issuecomment-543208513
+    - block:
+        - name: Install the legacy version of arptables, ebtables and iptables packages
+          apt:
+            name:
+              - arptables
+              - ebtables
+              - iptables
+            state: latest
+            update_cache: true
+
+        - name: Use the legacy version of arptables, ebtables, iptables and ip6tables packages
+          alternatives:
+            name: "{{item}}"
+            path: "/usr/sbin/{{item}}-legacy"
+          with_items:
+            - arptables
+            - ebtables
+            - iptables
+            - ip6tables
+      when: ansible_lsb.major_release == "10" # Only for Debian Buster
+
+    - name: Remove SWAP mounts from /etc/fstab
+      mount:
+        path: none
+        fstype: swap
+        state: absent
+
+    - name: Disable SWAP memory
+      command: /sbin/swapoff -a
+      when: ansible_swaptotal_mb > 0 # Only if there is swap
+
+    - name: Add Google Cloud’s official GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+
+    - name: Add the Kubernetes apt repository
+      apt_repository:
+        filename: kubernetes.list
+        repo: "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+
+    - name: Install kubeadm, kubectl and kubelet packages
+      apt:
+        name:
+          - "kubeadm={{k8s_version}}"
+          - "kubectl={{k8s_version}}"
+          - "kubelet={{k8s_version}}"
+        update_cache: true
+
+    - name: Prevent kubeadm, kubectl and kubelet packages from being upgraded
+      dpkg_selections:
+        name: "{{item}}"
+        selection: hold
+      with_items:
+        - kubeadm
+        - kubectl
+        - kubelet
+
+    - name: Get the status of installed services
+      service_facts:
+
+    # Install k8s-self-hosted-recovery. See:
+    # https://github.com/xetys/k8s-self-hosted-recovery.git
+    - block:
+        - name: Clone the k8s-self-hosted-recovery repository
+          git:
+            repo: https://github.com/xetys/k8s-self-hosted-recovery.git
+            dest: /tmp/k8s-self-hosted-recovery/
+            version: master
+
+        - name: Install the k8s-self-hosted-recovery service
+          shell: /tmp/k8s-self-hosted-recovery/install.sh
+          args:
+            chdir: /tmp/k8s-self-hosted-recovery/
+      when: ansible_facts.services["k8s-self-hosted-recover.service"] is not defined
+
+- hosts: master
+  vars:
+    # Temporarily setup a valid "sudoer" PATH variable for the kube user.
+    sudoer_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  tasks:
+    - name: Check if the cluster is already initialized
+      command: kubectl cluster-info
+      register: cluster_info
+      failed_when: cluster_info.rc > 1
+
+    - block:
+        - name: Initialize the Kubernetes cluster using kubeadm
+          become: true
+          shell: |
+            kubeadm init \
+            --apiserver-advertise-address="{{k8s_control_plane_ip}}" \
+            --apiserver-cert-extra-sans="{{k8s_control_plane_ip}}" \
+            --node-name="{{hostvars["main"].ansible_hostname}}" \
+            --pod-network-cidr=10.244.0.0/16 > /var/log/init.log
+          environment:
+            PATH: "{{sudoer_path}}"
+
+        - name: Create the Kubernetes configuration directory
+          file:
+            path: .kube
+            state: directory
+
+        - name: Copy the kubectl configuration file
+          become: true
+          copy:
+            src: /etc/kubernetes/admin.conf
+            remote_src: true
+            dest: .kube/config
+            owner: "{{ansible_facts.user_id}}"
+
+        - name: Install Flannel
+          command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+
+        - name: Untaint the control-plane node to schedule Pods
+          command: kubectl taint node "{{hostvars["main"].ansible_hostname}}" node-role.kubernetes.io/master-
+
+        - name: Tag the new node with the "main" label
+          command: kubectl label node "{{hostvars["main"].ansible_hostname}}" role=main
+      when: cluster_info.stderr != ""
+
+    - name: Generate the join command for workers
+      become: true
+      command: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Export the join command to a local file
+      local_action:
+        module: copy
+        content: "{{join_command.stdout_lines[0]}}"
+        dest: src/join.sh
+
+- hosts: workers
+  vars:
+    # Temporarily setup a valid "sudoer" PATH variable for the kube user.
+    sudoer_path: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  tasks:
+    - name: Get the status of installed services
+      service_facts:
+
+    - block:
+        - name: Copy the join command
+          become: true
+          copy:
+            src: src/join.sh
+            dest: /tmp/join.sh
+            mode: 0755
+
+        - name: Add the node to the cluster
+          become: true
+          shell: /tmp/join.sh > /var/log/join.log
+          environment:
+            PATH: "{{sudoer_path}}"
+      when:
+        - ansible_facts.services["kubelet.service"].state != "running"
