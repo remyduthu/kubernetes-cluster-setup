@@ -1,0 +1,47 @@
+- hosts: data
+  become: true
+  tasks:
+    - name: Install the NFS server packages
+      apt:
+        name:
+          - nfs-common
+          - nfs-kernel-server
+        state: present
+
+    - name: Create the nfs group
+      group:
+        name: nfs
+
+    - name: Create the nfs user
+      user:
+        name: nfs
+        group: nfs
+        shell: /bin/bash
+
+    - name: Create working directories
+      file:
+        path: /home/nfs/provisioner/
+        owner: nfs
+        group: nfs
+        state: directory
+
+    - name: Copy the /etc/exports file
+      template:
+        src: src/exports.j2
+        dest: /etc/exports
+        owner: root
+        group: root
+        mode: 0644
+      notify: reload nfs
+
+  handlers:
+    - name: reload nfs
+      command: "/usr/sbin/exportfs -ar"
+
+- hosts: master:workers
+  become: true
+  tasks:
+    - name: Install the NFS client package
+      apt:
+        name: nfs-common
+        state: present

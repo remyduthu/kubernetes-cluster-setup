@@ -1,0 +1,3 @@
+# {{ansible_managed}}
+
+/home/nfs/provisioner/ {{hostvars["main"].ansible_host}}("no_root_squash,no_subtree_check,rw,sync") {%for worker in groups.workers%}{{hostvars[worker].ansible_host}}("no_root_squash,no_subtree_check,rw,sync") {%endfor%}
