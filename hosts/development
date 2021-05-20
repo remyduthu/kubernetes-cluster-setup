@@ -1,0 +1,6 @@
+main ansible_host=10.0.0.10 ansible_ssh_private_key_file=.vagrant/machines/main/virtualbox/private_key
+
+[workers]
+worker ansible_host=10.0.0.11 ansible_ssh_private_key_file=.vagrant/machines/worker/virtualbox/private_key
+
+data ansible_host=10.0.0.12 ansible_ssh_private_key_file=.vagrant/machines/data/virtualbox/private_key
